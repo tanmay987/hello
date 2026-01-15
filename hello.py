@@ -1,27 +1,27 @@
-import xml.etree.ElementTree as ET
+import re
 
-# WordprocessingML namespace
-NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+LINE_RE = re.compile(r"^\[P(\d+)\]\s?(.*)$")                    # matches "[P12] rest of paragraph text"
 
-def extract_plain(document_xml_path: str, out_txt: str):
-    tree = ET.parse(document_xml_path)                          # load document.xml into memory
-    root = tree.getroot()                                       # get root element <w:document>
+def parse_updated_txt(updated_txt_path: str) -> dict[int, str]:
+    edits = {}                                                  # paragraph_id -> updated marked paragraph
 
-    paragraphs = root.findall(".//w:p", NS)                     # find all paragraph nodes in the document
+    with open(updated_txt_path, "r", encoding="utf-8") as f:    # open updated.txt
+        for line in f:                                          # read line-by-line
+            line = line.rstrip("\n")                            # remove newline at end
+            if not line.strip():                                # skip empty lines
+                continue
 
-    with open(out_txt, "w", encoding="utf-8") as f:             # open output file
-        for i, p in enumerate(paragraphs, start=1):             # enumerate paragraphs (1-based)
-            parts = []                                          # collect plain text fragments
-            for t in p.findall(".//w:t", NS):                   # find all <w:t> nodes (visible text)
-                if t.text:                                      # if node actually has text
-                    parts.append(t.text)                        # append fragment
-            para_text = "".join(parts).replace("\n", " ")       # join fragments into paragraph text
-            f.write(f"[P{i}] {para_text}\n")                    # write paragraph line
+            m = LINE_RE.match(line)                             # extract paragraph id
+            if not m:                                           # ignore lines not in format
+                continue
 
-    print(f"✅ Extracted {len(paragraphs)} paragraphs to {out_txt}")
+            pid = int(m.group(1))                               # paragraph number
+            content = m.group(2)                                # the paragraph content after [P...]
+            edits[pid] = content                                # store mapping
+
+    return edits                                                 # return dict
 
 # ---- Usage ----
-# extract_plain("word/document.xml", "plain.txt")
-
 if __name__ == "__main__":
-    extract_plain("word/document.xml", "plain.txt")
+    edits = parse_updated_txt("updated.txt")                    # parse updated.txt
+    print(edits)                                                # print dictionary
