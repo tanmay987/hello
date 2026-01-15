@@ -1,57 +1,27 @@
-import yaml
+import xml.etree.ElementTree as ET
 
-# ---- Base class we want to inherit from ----
-class Person:
-    def __init__(self, name, age):
-        self.name = name
-        self.age = age
-    
-    def greet(self):
-        print(f"Hello, I’m {self.name}, {self.age} years old.")
+# WordprocessingML namespace
+NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
-# ---- YAML-driven class generator ----
-with open("classes.yaml", "r") as f:
-    data = yaml.safe_load(f)
+def extract_plain(document_xml_path: str, out_txt: str):
+    tree = ET.parse(document_xml_path)                          # load document.xml into memory
+    root = tree.getroot()                                       # get root element <w:document>
 
-generated_classes = {}
+    paragraphs = root.findall(".//w:p", NS)                     # find all paragraph nodes in the document
 
-def create_class(name, base, attributes, methods):
-    # dynamic __init__ extending the base __init__
-    def __init__(self, *args, **kwargs):
-        # call base __init__
-        super(self.__class__, self).__init__(*args, **kwargs)
-        # set new attributes
-        for attr in attributes:
-            setattr(self, attr, kwargs.get(attr))
-    
-    namespace = {"__init__": __init__}
-    
-    for method in methods:
-        def func(self, method_name=method):  # capture method name
-            print(f"{method_name} called on {name}")
-        namespace[method] = func
-    
-    return type(name, (base,), namespace)
+    with open(out_txt, "w", encoding="utf-8") as f:             # open output file
+        for i, p in enumerate(paragraphs, start=1):             # enumerate paragraphs (1-based)
+            parts = []                                          # collect plain text fragments
+            for t in p.findall(".//w:t", NS):                   # find all <w:t> nodes (visible text)
+                if t.text:                                      # if node actually has text
+                    parts.append(t.text)                        # append fragment
+            para_text = "".join(parts).replace("\n", " ")       # join fragments into paragraph text
+            f.write(f"[P{i}] {para_text}\n")                    # write paragraph line
 
-# ---- Generate Classes ----
-for class_name, props in data.items():
-    base_name = props.get("base", "object")
-    base_cls = globals().get(base_name, object)  # resolve base class
-    attrs = props.get("attributes", [])
-    methods = props.get("methods", [])
-    generated_classes[class_name] = create_class(class_name, base_cls, attrs, methods)
+    print(f"✅ Extracted {len(paragraphs)} paragraphs to {out_txt}")
 
 # ---- Usage ----
-Student = generated_classes["Student"]
-Teacher = generated_classes["Teacher"]
+# extract_plain("word/document.xml", "plain.txt")
 
-s = Student(name="Alice", age=20, roll_no="101", grade="A")
-t = Teacher(name="Bob", age=40, subject="Math")
-
-s.greet()
-s.study()
-print(s.roll_no, s.grade)
-
-t.greet()
-t.teach()
-print(t.subject)
+if __name__ == "__main__":
+    extract_plain("word/document.xml", "plain.txt")
