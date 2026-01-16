@@ -11,9 +11,11 @@ NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 ET.register_namespace("w", NS["w"])
 
 def w_tag(tag: str) -> str:
+    """Return fully-qualified WordprocessingML tag."""
     return f"{{{NS['w']}}}{tag}"
 
 def now_w3c() -> str:
+    """UTC timestamp in Word track-changes format."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ----------------------------
@@ -24,6 +26,7 @@ MARK_RE = re.compile(r"<(INS|DEL):(.*?)>", re.DOTALL)
 WORD_RE = re.compile(r"\s+|[^\s]+")
 
 def parse_updated_txt(path: str) -> dict[int, str]:
+    """Parse updated.txt into {paragraph_id: marked_content}."""
     out = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -37,17 +40,25 @@ def parse_updated_txt(path: str) -> dict[int, str]:
     return out
 
 def split_tokens(text: str) -> list[str]:
+    """Split text into word/space tokens (spaces preserved)."""
     return [m.group(0) for m in WORD_RE.finditer(text)]
 
 def strip_markers_keep_text(updated_marked: str) -> str:
     """Remove <INS:..> and <DEL:..> blocks, leaving only outside text."""
-    # Replace markers with empty string
     return MARK_RE.sub("", updated_marked)
+
+def extract_all_del_text(updated_marked: str) -> list[str]:
+    """Return list of all deletion block contents (<DEL:...>) in updated_marked."""
+    dels = []
+    for m in MARK_RE.finditer(updated_marked):
+        if m.group(1) == "DEL":
+            dels.append(m.group(2))
+    return dels
 
 def tokenize_updated_atomic(updated_marked: str):
     """
     Token stream:
-      ("TEXTTOK", token) -> outside markers
+      ("TEXTTOK", token) -> outside markers (tokenized word/space)
       ("INSBLOCK", text) -> atomic INS
       ("DELBLOCK", text) -> atomic DEL
     """
@@ -70,6 +81,7 @@ def tokenize_updated_atomic(updated_marked: str):
 # Word XML utilities
 # ----------------------------
 def build_paragraph_fulltext_and_runs(p: ET.Element):
+    """Return (full_text, run_map) for ALL runs in the paragraph."""
     full_text = ""
     run_map = []
     for r in p.findall(".//w:r", NS):
@@ -85,7 +97,24 @@ def build_paragraph_fulltext_and_runs(p: ET.Element):
             run_map.append({"r": r, "start": start, "end": end, "text": run_text})
     return full_text, run_map
 
+def find_run_covering_offset(run_map: list[dict], off: int):
+    """Find run-map entry covering character offset 'off'."""
+    if not run_map:
+        return None
+    if off <= 0:
+        return run_map[0]
+    if off >= run_map[-1]["end"]:
+        return run_map[-1]
+    for m in run_map:
+        if m["start"] <= off < m["end"]:
+            return m
+    return run_map[-1]
+
 def split_run_at(run: ET.Element, offset: int):
+    """
+    Split a run into left/right at offset preserving formatting.
+    ALWAYS preserve spaces to avoid word-collisions.
+    """
     t_nodes = run.findall(".//w:t", NS)
     combined = "".join([(t.text or "") for t in t_nodes])
 
@@ -95,6 +124,7 @@ def split_run_at(run: ET.Element, offset: int):
     left = deepcopy(run)
     right = deepcopy(run)
 
+    # Remove direct w:t children from clones
     for node in list(left):
         if node.tag == w_tag("t"):
             left.remove(node)
@@ -115,6 +145,7 @@ def split_run_at(run: ET.Element, offset: int):
     return left, right
 
 def make_ins(run_template: ET.Element, text: str, ins_id: int, author: str, date: str):
+    """Create a single <w:ins> containing the entire inserted text."""
     ins = ET.Element(w_tag("ins"))
     ins.set(w_tag("id"), str(ins_id))
     ins.set(w_tag("author"), author)
@@ -134,6 +165,7 @@ def make_ins(run_template: ET.Element, text: str, ins_id: int, author: str, date
     return ins
 
 def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date: str):
+    """Create a single <w:del> containing the entire deleted text."""
     dele = ET.Element(w_tag("del"))
     dele.set(w_tag("id"), str(del_id))
     dele.set(w_tag("author"), author)
@@ -153,28 +185,31 @@ def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date
     return dele
 
 # ----------------------------
-# Step 1: filter doc runs using updated outside text
+# Step 1: filter doc runs using updated outside-text + DEL text
 # ----------------------------
 def filter_paragraph_by_updated_text(p: ET.Element, updated_keep_counter: Counter):
     """
     Remove tokens from document.xml paragraph that do not appear in updated_keep_counter.
 
-    Preserves formatting: we rebuild runs, keeping original run properties.
+    IMPORTANT:
+      - Keep tokens that appear in updated outside markers
+      - ALSO keep tokens inside <DEL:...> blocks (so they can be wrapped later)
     """
     new_children = []
+
     for ch in list(p):
-        # keep paragraph properties nodes as-is
+        # Keep non-run children unchanged (e.g., pPr)
         if ch.tag != w_tag("r"):
             new_children.append(ch)
             continue
 
-        # process this run
         run = ch
         parts = []
         for t in run.findall(".//w:t", NS):
             if t.text:
                 parts.append(t.text)
         run_text = "".join(parts)
+
         if not run_text:
             continue
 
@@ -185,12 +220,11 @@ def filter_paragraph_by_updated_text(p: ET.Element, updated_keep_counter: Counte
             if updated_keep_counter[tok] > 0:
                 kept_tokens.append(tok)
                 updated_keep_counter[tok] -= 1
-            else:
-                # drop token
-                pass
+            # else drop tok
 
         kept_text = "".join(kept_tokens)
-        if kept_text.strip("") == "" and kept_text == "":
+
+        if kept_text == "":
             continue
 
         # rebuild run with kept_text
@@ -198,6 +232,7 @@ def filter_paragraph_by_updated_text(p: ET.Element, updated_keep_counter: Counte
         for node in list(new_run):
             if node.tag == w_tag("t"):
                 new_run.remove(node)
+
         t_new = ET.Element(w_tag("t"))
         t_new.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         t_new.text = kept_text
@@ -205,7 +240,7 @@ def filter_paragraph_by_updated_text(p: ET.Element, updated_keep_counter: Counte
 
         new_children.append(new_run)
 
-    # replace paragraph children
+    # Replace paragraph children
     for ch in list(p):
         p.remove(ch)
     for ch in new_children:
@@ -213,22 +248,14 @@ def filter_paragraph_by_updated_text(p: ET.Element, updated_keep_counter: Counte
 
 # ----------------------------
 # Step 2: apply explicit INS/DEL markers to filtered doc paragraph
-# (Uses previous correct INS placement + correct DEL wrapping)
 # ----------------------------
-def find_run_covering_offset(run_map: list[dict], off: int):
-    if not run_map:
-        return None
-    if off <= 0:
-        return run_map[0]
-    if off >= run_map[-1]["end"]:
-        return run_map[-1]
-    for m in run_map:
-        if m["start"] <= off < m["end"]:
-            return m
-    return run_map[-1]
-
 def apply_delete_span(old_children, run_map, new_children, child_idx_ref, start_off, del_text, author, next_id, date):
+    """
+    Replace the original normal run span with a single <w:del>,
+    ensuring deletion text does NOT remain as normal runs.
+    """
     end_off = start_off + len(del_text)
+
     first_rm = find_run_covering_offset(run_map, start_off)
     last_rm = find_run_covering_offset(run_map, max(start_off, end_off - 1))
     if not first_rm or not last_rm:
@@ -237,6 +264,7 @@ def apply_delete_span(old_children, run_map, new_children, child_idx_ref, start_
     first_run = first_rm["r"]
     last_run = last_rm["r"]
 
+    # copy children until first_run
     while child_idx_ref[0] < len(old_children):
         ch = old_children[child_idx_ref[0]]
         if ch is first_run:
@@ -244,15 +272,19 @@ def apply_delete_span(old_children, run_map, new_children, child_idx_ref, start_
         new_children.append(ch)
         child_idx_ref[0] += 1
 
+    # fallback if cannot find
     if child_idx_ref[0] >= len(old_children) or old_children[child_idx_ref[0]] is not first_run:
         new_children.append(make_del(first_run, del_text, next_id, author, date))
         return next_id + 1
 
+    # local offsets
     first_local = start_off - first_rm["start"]
     last_local = end_off - last_rm["start"]
 
+    # split first run at start
     left_first, right_first = split_run_at(first_run, first_local)
 
+    # split last run at end
     if first_run is last_run:
         _mid, right_last = split_run_at(right_first, last_local - first_local)
     else:
@@ -281,6 +313,11 @@ def apply_delete_span(old_children, run_map, new_children, child_idx_ref, start_
     return next_id
 
 def apply_markers_to_filtered_doc(p: ET.Element, updated_marked: str, author: str, next_id: int):
+    """
+    After filtering paragraph, apply:
+      - <DEL:...> : wrap and remove span
+      - <INS:...> : insert at correct place (next anchor strategy)
+    """
     original_text, run_map = build_paragraph_fulltext_and_runs(p)
     if not original_text or not run_map:
         return next_id
@@ -290,7 +327,6 @@ def apply_markers_to_filtered_doc(p: ET.Element, updated_marked: str, author: st
     events = []
     date = now_w3c()
 
-    # compute events
     i = 0
     while i < len(upd_tokens):
         kind, payload = upd_tokens[i]
@@ -298,6 +334,7 @@ def apply_markers_to_filtered_doc(p: ET.Element, updated_marked: str, author: st
         if kind == "TEXTTOK":
             if original_text.startswith(payload, cursor_char):
                 cursor_char += len(payload)
+            # else ignore mismatch outside marker
             i += 1
             continue
 
@@ -312,7 +349,8 @@ def apply_markers_to_filtered_doc(p: ET.Element, updated_marked: str, author: st
 
         if kind == "INSBLOCK":
             ins_text = payload
-            # next-anchor
+
+            # next anchor: find next meaningful TEXT token
             j = i + 1
             anchor = None
             while j < len(upd_tokens):
@@ -357,6 +395,7 @@ def apply_markers_to_filtered_doc(p: ET.Element, updated_marked: str, author: st
                 continue
             base_run = rm["r"]
 
+            # copy children until base_run
             while child_idx_ref[0] < len(old_children):
                 ch = old_children[child_idx_ref[0]]
                 if ch is base_run:
@@ -364,6 +403,7 @@ def apply_markers_to_filtered_doc(p: ET.Element, updated_marked: str, author: st
                 new_children.append(ch)
                 child_idx_ref[0] += 1
 
+            # fallback: append
             if child_idx_ref[0] >= len(old_children) or old_children[child_idx_ref[0]] is not base_run:
                 new_children.append(make_ins(base_run, text, next_id, author, date))
                 next_id += 1
@@ -373,6 +413,8 @@ def apply_markers_to_filtered_doc(p: ET.Element, updated_marked: str, author: st
             local = max(0, min(local, rm["end"] - rm["start"]))
 
             left_run, right_run = split_run_at(base_run, local)
+
+            # consume base_run
             child_idx_ref[0] += 1
 
             if left_run.findall(".//w:t", NS):
@@ -384,10 +426,12 @@ def apply_markers_to_filtered_doc(p: ET.Element, updated_marked: str, author: st
             if right_run.findall(".//w:t", NS):
                 new_children.append(right_run)
 
+    # append remaining original children
     while child_idx_ref[0] < len(old_children):
         new_children.append(old_children[child_idx_ref[0]])
         child_idx_ref[0] += 1
 
+    # replace paragraph children
     for ch in list(p):
         p.remove(ch)
     for ch in new_children:
@@ -414,15 +458,21 @@ def apply_track_changes(document_xml_path: str, updated_txt_path: str, author: s
 
         updated_marked = edits[i]
 
-        # Build "keep" multiset from updated outside text
+        # OUTSIDE TEXT tokens
         updated_keep_text = strip_markers_keep_text(updated_marked)
-        keep_counter = Counter(split_tokens(updated_keep_text))
 
-        # 1) Filter doc paragraph tokens (drop missing words)
+        # ALSO include deletion tokens so filter doesn't drop them before wrapping
+        del_texts = extract_all_del_text(updated_marked)
+        del_keep_text = "".join(del_texts)
+
+        keep_counter = Counter(split_tokens(updated_keep_text + del_keep_text))
+
+        # 1) Filter doc paragraph tokens (drop words not present in updated or DEL blocks)
         filter_paragraph_by_updated_text(p, keep_counter)
 
         # 2) Apply markers INS/DEL
         next_id = apply_markers_to_filtered_doc(p, updated_marked, author, next_id)
+
         changed += 1
 
     tree.write(document_xml_path, encoding="utf-8", xml_declaration=True)
