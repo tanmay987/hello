@@ -39,6 +39,12 @@ def split_text_tokens(text: str) -> list[str]:
     return [m.group(0) for m in WORD_RE.finditer(text)]
 
 def tokenize_updated_atomic(s: str):
+    """
+    Token stream:
+      ("TEXTTOK", token) -> word/space tokens outside markers
+      ("INSBLOCK", text) -> whole INS content
+      ("DELBLOCK", text) -> whole DEL content
+    """
     tokens = []
     pos = 0
     for m in MARK_RE.finditer(s):
@@ -59,10 +65,39 @@ def tokenize_updated_atomic(s: str):
     return tokens
 
 # ============================
-# Word text extraction
+# Paragraph extraction
 # ============================
+def extract_run_spans(p: ET.Element):
+    """
+    Extract original paragraph as a list of spans:
+      (start_off, end_off, run_template, text)
+
+    Where run_template is the original <w:r> element.
+
+    We use .//w:r to include hyperlink runs etc.
+    """
+    spans = []
+    off = 0
+
+    for r in p.findall(".//w:r", NS):
+        texts = []
+        for t in r.findall(".//w:t", NS):
+            if t.text:
+                texts.append(t.text)
+        run_text = "".join(texts)
+
+        if not run_text:
+            continue
+
+        start = off
+        end = off + len(run_text)
+        spans.append((start, end, r, run_text))
+        off = end
+
+    full_text = "".join([s[3] for s in spans])
+    return full_text, spans
+
 def paragraph_plain_text(p: ET.Element) -> str:
-    """Extract visible plain text in this paragraph (concatenate all w:t)."""
     parts = []
     for t in p.findall(".//w:t", NS):
         if t.text:
@@ -70,14 +105,43 @@ def paragraph_plain_text(p: ET.Element) -> str:
     return "".join(parts)
 
 # ============================
-# XML helpers
+# Formatting mapping
 # ============================
-def get_first_run_template(p: ET.Element) -> ET.Element:
-    r = p.find(".//w:r", NS)
-    return r if r is not None else ET.Element(w_tag("r"))
+def pick_template_for_offset(spans, char_off: int):
+    """
+    Pick a run template based on where char_off falls in original spans.
+    If out of range, return nearest run.
+    """
+    if not spans:
+        return ET.Element(w_tag("r"))
+
+    if char_off <= spans[0][0]:
+        return spans[0][2]
+    if char_off >= spans[-1][1]:
+        return spans[-1][2]
+
+    for start, end, run, _txt in spans:
+        if start <= char_off < end:
+            return run
+
+    return spans[-1][2]
+
+# ============================
+# XML builders
+# ============================
+def clear_paragraph_runs(p: ET.Element):
+    """Remove all runs/ins/del, keep pPr intact."""
+    for ch in list(p):
+        if ch.tag in {w_tag("r"), w_tag("ins"), w_tag("del")}:
+            p.remove(ch)
 
 def make_plain_run(run_template: ET.Element, text: str) -> ET.Element:
+    """
+    Create normal run with same formatting as run_template.
+    Always preserve spaces.
+    """
     r = deepcopy(run_template)
+    # remove direct <w:t> children
     for node in list(r):
         if node.tag == w_tag("t"):
             r.remove(node)
@@ -93,7 +157,6 @@ def make_ins(run_template: ET.Element, text: str, ins_id: int, author: str, date
     ins.set(w_tag("id"), str(ins_id))
     ins.set(w_tag("author"), author)
     ins.set(w_tag("date"), date)
-
     ins.append(make_plain_run(run_template, text))
     return ins
 
@@ -116,48 +179,84 @@ def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date
     dele.append(r)
     return dele
 
-def clear_paragraph_runs(p: ET.Element):
-    """Remove r/ins/del nodes, keep pPr intact."""
-    for ch in list(p):
-        if ch.tag in {w_tag("r"), w_tag("ins"), w_tag("del")}:
-            p.remove(ch)
+# ============================
+# Core: rebuild paragraph with formatting + strict del
+# ============================
+def rebuild_paragraph_truth_preserve_format_strict_del(
+    p: ET.Element,
+    updated_marked: str,
+    author: str,
+    next_id: int,
+):
+    """
+    Ground-truth rebuild:
+      - updated_marked defines content
+      - TEXTTOK: normal run
+      - INS: tracked insertion
+      - DEL: tracked deletion ONLY if payload exists in original paragraph text
+      - formatting: each emitted segment uses run template chosen by original char offset
+    """
+    original_text, spans = extract_run_spans(p)
+    strict_original_plain = original_text  # visible original text
 
-# ============================
-# Strict rebuild paragraph
-# ============================
-def rebuild_paragraph_from_updated_strict_del(p: ET.Element, updated_marked: str, author: str, next_id: int):
-    """
-    Ground truth rebuild:
-      - TEXTTOK and INS always applied
-      - DEL only applied if del_text exists in original paragraph text
-    """
-    original_text = paragraph_plain_text(p)                 # original paragraph visible text
     tokens = tokenize_updated_atomic(updated_marked)
     date = now_w3c()
-    template_run = get_first_run_template(p)
 
     clear_paragraph_runs(p)
 
+    # We'll track an approximate "cursor" into original_text for formatting selection
+    # TEXTTOK advances cursor when it matches at cursor; otherwise cursor stays.
+    cursor = 0
+
     for kind, payload in tokens:
         if kind == "TEXTTOK":
-            if payload:
-                p.append(make_plain_run(template_run, payload))
-
-        elif kind == "INSBLOCK":
-            if payload:
-                p.append(make_ins(template_run, payload, next_id, author, date))
-                next_id += 1
-
-        elif kind == "DELBLOCK":
-            if not payload:
+            if payload == "":
                 continue
 
-            # ✅ STRICT: only emit DEL if payload exists in original paragraph text
-            if payload in original_text:
-                p.append(make_del(template_run, payload, next_id, author, date))
-                next_id += 1
+            # pick formatting near current cursor
+            template = pick_template_for_offset(spans, cursor)
+
+            # emit normal run
+            p.append(make_plain_run(template, payload))
+
+            # advance cursor if it matches original at this position (best-effort)
+            if strict_original_plain.startswith(payload, cursor):
+                cursor += len(payload)
             else:
-                # ignore deletion block
+                # mismatch => do NOT move cursor (updated is truth)
+                pass
+
+        elif kind == "INSBLOCK":
+            if payload == "":
+                continue
+
+            # insertion: use formatting at cursor position
+            template = pick_template_for_offset(spans, cursor)
+            p.append(make_ins(template, payload, next_id, author, date))
+            next_id += 1
+
+            # insertion isn't in original => do not move cursor
+
+        elif kind == "DELBLOCK":
+            if payload == "":
+                continue
+
+            # STRICT deletion: only emit if payload exists somewhere in original paragraph
+            if payload in strict_original_plain:
+                # choose formatting where it occurs (closest after cursor if possible)
+                pos = strict_original_plain.find(payload, cursor)
+                if pos < 0:
+                    pos = strict_original_plain.find(payload)
+
+                template = pick_template_for_offset(spans, pos if pos >= 0 else cursor)
+                p.append(make_del(template, payload, next_id, author, date))
+                next_id += 1
+
+                # if deleted text occurs after cursor, advance cursor past it
+                if pos >= cursor and pos >= 0:
+                    cursor = pos + len(payload)
+            else:
+                # ignore deletion if not present in original
                 pass
 
     return next_id
@@ -178,11 +277,16 @@ def apply_track_changes(document_xml_path: str, updated_txt_path: str, author: s
     for i, p in enumerate(paragraphs, start=1):
         if i not in edits:
             continue
-        next_id = rebuild_paragraph_from_updated_strict_del(p, edits[i], author, next_id)
+        next_id = rebuild_paragraph_truth_preserve_format_strict_del(
+            p=p,
+            updated_marked=edits[i],
+            author=author,
+            next_id=next_id,
+        )
         changed += 1
 
     tree.write(document_xml_path, encoding="utf-8", xml_declaration=True)
-    print(f"✅ Rebuilt {changed} paragraphs (strict DEL mode).")
+    print(f"✅ Rebuilt {changed} paragraphs (updated truth + strict DEL + preserved formatting).")
 
 if __name__ == "__main__":
     apply_track_changes("word/document.xml", "updated.txt", author="Tanmay")
