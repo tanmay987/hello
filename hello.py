@@ -3,30 +3,45 @@ import xml.etree.ElementTree as ET
 from copy import deepcopy
 from collections import Counter
 from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
 
-# ----------------------------
-# Namespace
-# ----------------------------
+# ============================
+# WordprocessingML namespace
+# ============================
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 ET.register_namespace("w", NS["w"])
 
+
 def w_tag(tag: str) -> str:
+    """Return fully qualified WordprocessingML tag for ElementTree."""
     return f"{{{NS['w']}}}{tag}"
 
+
 def now_w3c() -> str:
+    """Return current UTC timestamp in Word track-changes format."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ----------------------------
+
+# ============================
 # updated.txt parsing
-# ----------------------------
+# ============================
 LINE_RE = re.compile(r"^\[P(\d+)\]\s?(.*)$")
 MARK_RE = re.compile(r"<(INS|DEL):(.*?)>", re.DOTALL)
 
-# Tokenizer that preserves EXACT whitespace chunks
-TOK_RE = re.compile(r"\s+|\S+")
+# Tokenizer:
+# - words: letters/digits/underscore
+# - punctuation: every other non-space char
+# - spaces ignored as tokens
+TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
-def parse_updated_txt(path: str) -> dict[int, str]:
-    out = {}
+
+def parse_updated_txt(path: str) -> Dict[int, str]:
+    """
+    Parse updated.txt into:
+      { paragraph_index (1-based) : paragraph_string_with_markers }
+    """
+    out: Dict[int, str] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.rstrip("\n")
@@ -38,143 +53,182 @@ def parse_updated_txt(path: str) -> dict[int, str]:
             out[int(m.group(1))] = m.group(2)
     return out
 
-def strip_markers_keep_text(updated_marked: str) -> str:
-    return MARK_RE.sub("", updated_marked)
 
-def extract_all_del_text(updated_marked: str) -> list[str]:
-    dels = []
-    for m in MARK_RE.finditer(updated_marked):
-        if m.group(1) == "DEL":
-            dels.append(m.group(2))
-    return dels
+def tokenize_words_punct(s: str) -> List[str]:
+    """
+    Tokenize into word + punctuation tokens.
+    Spaces are not tokens.
+    Examples:
+      "school," -> ["school", ","]
+      "in-car"  -> ["in", "-", "car"]
+    """
+    return [m.group(0) for m in TOKEN_RE.finditer(s)]
 
-def tokenize_updated_atomic(updated_marked: str):
+
+@dataclass
+class UpdatedPlan:
     """
-    ("TEXT", chunk outside markers) chunks are kept as raw strings (no tokenization here),
-    ("INS", ins_text) atomic,
-    ("DEL", del_text) atomic.
+    Parsed representation of one updated paragraph.
+
+    keep_tokens:
+      tokens outside INS/DEL (what remains visible normal text)
+    del_blocks:
+      list of deletion blocks, each a token sequence
+    ins_blocks:
+      list of insertion blocks (raw string as-is)
+    ins_anchors:
+      for each ins block, the next KEEP token after it (or None if insertion at end)
+      used to place insertion in the rebuilt paragraph.
     """
-    tokens = []
+    keep_tokens: List[str]
+    del_blocks: List[List[str]]
+    ins_blocks: List[str]
+    ins_anchors: List[Optional[str]]
+
+
+def parse_updated_paragraph(updated_marked: str) -> UpdatedPlan:
+    """
+    Parse one updated paragraph into KEEP tokens + DEL token blocks + INS blocks.
+
+    INS blocks remain raw text (we will insert as ONE <w:ins>).
+    DEL blocks become token sequences for matching against document.xml tokens.
+
+    Also computes insertion anchors:
+      for each INS block, anchor = next KEEP token after that INS marker.
+    """
+    keep_tokens: List[str] = []
+    del_blocks: List[List[str]] = []
+    ins_blocks: List[str] = []
+    ins_anchors: List[Optional[str]] = []
+
+    # We also build a stream of items in order:
+    # ("KEEP", token) or ("INS", raw) or ("DEL", token_list)
+    stream: List[Tuple[str, object]] = []
+
     pos = 0
     for m in MARK_RE.finditer(updated_marked):
         outside = updated_marked[pos:m.start()]
-        if outside:
-            tokens.append(("TEXT", outside))
+        for t in tokenize_words_punct(outside):
+            keep_tokens.append(t)
+            stream.append(("KEEP", t))
 
         kind = m.group(1)
         inner = m.group(2)
-        tokens.append((kind, inner))
+
+        if kind == "INS":
+            ins_blocks.append(inner)
+            stream.append(("INS", inner))
+        else:
+            del_toks = tokenize_words_punct(inner)
+            del_blocks.append(del_toks)
+            stream.append(("DEL", del_toks))
 
         pos = m.end()
 
     tail = updated_marked[pos:]
-    if tail:
-        tokens.append(("TEXT", tail))
-    return tokens
+    for t in tokenize_words_punct(tail):
+        keep_tokens.append(t)
+        stream.append(("KEEP", t))
 
-def split_ws_tokens(s: str) -> list[str]:
-    """Split into whitespace and non-whitespace tokens (exact whitespace preserved)."""
-    return [m.group(0) for m in TOK_RE.finditer(s)]
+    # Compute INS anchors: next KEEP token in the stream after INS
+    for idx, (k, v) in enumerate(stream):
+        if k != "INS":
+            continue
+        anchor = None
+        for j in range(idx + 1, len(stream)):
+            if stream[j][0] == "KEEP":
+                anchor = stream[j][1]  # token string
+                break
+        ins_anchors.append(anchor)
 
-def words_only(s: str) -> list[str]:
-    """Return list of non-whitespace tokens."""
-    return [t for t in split_ws_tokens(s) if not t.isspace()]
+    return UpdatedPlan(
+        keep_tokens=keep_tokens,
+        del_blocks=del_blocks,
+        ins_blocks=ins_blocks,
+        ins_anchors=ins_anchors,
+    )
 
-# ----------------------------
-# Word XML utilities
-# ----------------------------
-def paragraph_runs(p: ET.Element):
-    """Return list of run elements under paragraph."""
-    return p.findall(".//w:r", NS)
 
-def run_text(run: ET.Element) -> str:
-    """Concatenate all w:t text nodes of a run."""
+# ============================
+# document.xml tokenization with run mapping
+# ============================
+@dataclass
+class DocToken:
+    """
+    One token from document.xml paragraph.
+    token: token string (word/punctuation)
+    run_template: the original <w:r> node this token came from (formatting source)
+    """
+    token: str
+    run_template: ET.Element
+
+
+def extract_run_text(run: ET.Element) -> str:
+    """Concatenate visible text from all <w:t> nodes inside this run."""
     parts = []
     for t in run.findall(".//w:t", NS):
         if t.text:
             parts.append(t.text)
     return "".join(parts)
 
-def set_run_text_preserve(run: ET.Element, text: str):
-    """Replace run's w:t children with a single w:t containing text preserving spaces."""
-    for node in list(run):
+
+def build_doc_tokens(p: ET.Element) -> List[DocToken]:
+    """
+    Convert document.xml paragraph into token list with formatting mapping.
+
+    We walk runs in order:
+      each token inherits formatting from the run it came from.
+    """
+    tokens: List[DocToken] = []
+    for r in p.findall(".//w:r", NS):
+        txt = extract_run_text(r)
+        if not txt:
+            continue
+        for tok in tokenize_words_punct(txt):
+            tokens.append(DocToken(tok, r))
+    return tokens
+
+
+# ============================
+# Track-change node constructors
+# ============================
+def clone_run_with_text(run_template: ET.Element, text: str) -> ET.Element:
+    """
+    Clone run template and set its visible text to `text`
+    with xml:space="preserve" to avoid space-loss collisions.
+    """
+    r = deepcopy(run_template)
+
+    # remove direct <w:t> children
+    for node in list(r):
         if node.tag == w_tag("t"):
-            run.remove(node)
+            r.remove(node)
+
     t = ET.Element(w_tag("t"))
     t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
     t.text = text
-    run.append(t)
+    r.append(t)
+    return r
 
-def build_paragraph_fulltext_and_runs(p: ET.Element):
-    full_text = ""
-    run_map = []
-    for r in p.findall(".//w:r", NS):
-        txt = run_text(r)
-        if not txt:
-            continue
-        start = len(full_text)
-        full_text += txt
-        end = len(full_text)
-        run_map.append({"r": r, "start": start, "end": end, "text": txt})
-    return full_text, run_map
 
-def find_run_covering_offset(run_map: list[dict], off: int):
-    if not run_map:
-        return None
-    if off <= 0:
-        return run_map[0]
-    if off >= run_map[-1]["end"]:
-        return run_map[-1]
-    for m in run_map:
-        if m["start"] <= off < m["end"]:
-            return m
-    return run_map[-1]
-
-def split_run_at(run: ET.Element, offset: int):
-    """Split a run at offset preserving formatting and preserving whitespace."""
-    combined = run_text(run)
-
-    left_text = combined[:offset]
-    right_text = combined[offset:]
-
-    left = deepcopy(run)
-    right = deepcopy(run)
-
-    set_run_text_preserve(left, left_text) if left_text != "" else set_run_text_preserve(left, "")
-    set_run_text_preserve(right, right_text) if right_text != "" else set_run_text_preserve(right, "")
-
-    # If empty text, remove w:t
-    if left_text == "":
-        for node in list(left):
-            if node.tag == w_tag("t"):
-                left.remove(node)
-    if right_text == "":
-        for node in list(right):
-            if node.tag == w_tag("t"):
-                right.remove(node)
-
-    return left, right
-
-def make_ins(run_template: ET.Element, text: str, ins_id: int, author: str, date: str):
+def make_ins(run_template: ET.Element, text: str, ins_id: int, author: str, date: str) -> ET.Element:
+    """Create one <w:ins> containing the whole inserted text."""
     ins = ET.Element(w_tag("ins"))
     ins.set(w_tag("id"), str(ins_id))
     ins.set(w_tag("author"), author)
     ins.set(w_tag("date"), date)
-
-    r = deepcopy(run_template)
-    set_run_text_preserve(r, text)
-    ins.append(r)
+    ins.append(clone_run_with_text(run_template, text))
     return ins
 
-def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date: str):
+
+def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date: str) -> ET.Element:
+    """Create one <w:del> containing the whole deleted text."""
     dele = ET.Element(w_tag("del"))
     dele.set(w_tag("id"), str(del_id))
     dele.set(w_tag("author"), author)
     dele.set(w_tag("date"), date)
 
     r = deepcopy(run_template)
-
-    # remove w:t
     for node in list(r):
         if node.tag == w_tag("t"):
             r.remove(node)
@@ -187,225 +241,224 @@ def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date
     dele.append(r)
     return dele
 
-# ----------------------------
-# Step 1: filter doc by updated words, preserving all whitespace
-# ----------------------------
-def filter_paragraph_preserve_spaces(p: ET.Element, keep_words_counter: Counter):
+
+# ============================
+# Core matching helpers
+# ============================
+def find_sequence(tokens: List[str], seq: List[str], start: int = 0) -> Optional[int]:
     """
-    Remove ONLY word-tokens that are not present in keep_words_counter.
-    Preserve whitespace tokens exactly as in the document.
+    Find seq inside tokens starting from index start.
+    Return starting index or None.
     """
-    for r in paragraph_runs(p):
-        txt = run_text(r)
-        if not txt:
-            continue
-
-        toks = split_ws_tokens(txt)
-        out = []
-
-        for tok in toks:
-            if tok.isspace():
-                # ✅ always keep whitespace exactly
-                out.append(tok)
-                continue
-
-            # word token
-            if keep_words_counter[tok] > 0:
-                out.append(tok)
-                keep_words_counter[tok] -= 1
-            else:
-                # drop word token but keep surrounding whitespace
-                pass
-
-        new_txt = "".join(out)
-
-        # Update run text (keep run formatting)
-        set_run_text_preserve(r, new_txt)
-
-# ----------------------------
-# Step 2: apply DEL by word-sequence match + INS by next-anchor
-# ----------------------------
-def find_word_sequence_span(full_text: str, del_words: list[str], start_char: int = 0):
-    """
-    Find character span (start,end) in full_text where del_words appear in sequence,
-    allowing arbitrary whitespace between them.
-    """
-    if not del_words:
+    if not seq:
         return None
+    n = len(tokens)
+    m = len(seq)
+    for i in range(start, n - m + 1):
+        if tokens[i : i + m] == seq:
+            return i
+    return None
 
-    # Build regex like: r'\bin\b\s+\bcar\b'
-    # But since tokens may include punctuation, use escaping + \s+
-    pattern = r"\s+".join(re.escape(w) for w in del_words)
-    rgx = re.compile(pattern)
 
-    m = rgx.search(full_text, start_char)
-    if not m:
-        return None
-    return (m.start(), m.end())
-
-def apply_delete_span(old_children, run_map, new_children, child_idx_ref, start_off, end_off, del_text, author, next_id, date):
+# ============================
+# Paragraph rebuild
+# ============================
+def rebuild_paragraph(
+    p: ET.Element,
+    updated: UpdatedPlan,
+    author: str,
+    next_id: int,
+) -> int:
     """
-    Remove original normal text [start_off, end_off) and replace it with one <w:del>.
+    Build a NEW paragraph content using:
+      - document.xml as formatting ground truth
+      - updated.txt as token truth for which tokens remain
+      - apply <DEL> as <w:del>
+      - apply <INS> as <w:ins>
+
+    Also removes doc tokens not present in updated KEEP tokens.
+
+    Returns updated next_id.
     """
-    first_rm = find_run_covering_offset(run_map, start_off)
-    last_rm = find_run_covering_offset(run_map, max(start_off, end_off - 1))
-    if not first_rm or not last_rm:
-        return next_id
-
-    first_run = first_rm["r"]
-    last_run = last_rm["r"]
-
-    # copy children until first_run
-    while child_idx_ref[0] < len(old_children):
-        ch = old_children[child_idx_ref[0]]
-        if ch is first_run:
-            break
-        new_children.append(ch)
-        child_idx_ref[0] += 1
-
-    if child_idx_ref[0] >= len(old_children) or old_children[child_idx_ref[0]] is not first_run:
-        new_children.append(make_del(first_run, del_text, next_id, author, date))
-        return next_id + 1
-
-    first_local = start_off - first_rm["start"]
-    last_local = end_off - last_rm["start"]
-
-    left_first, right_first = split_run_at(first_run, first_local)
-
-    if first_run is last_run:
-        _mid, right_last = split_run_at(right_first, last_local - first_local)
-    else:
-        _mid, right_last = split_run_at(last_run, last_local)
-
-    child_idx_ref[0] += 1
-
-    if first_run is not last_run:
-        while child_idx_ref[0] < len(old_children):
-            ch = old_children[child_idx_ref[0]]
-            child_idx_ref[0] += 1
-            if ch is last_run:
-                break
-
-    if left_first.findall(".//w:t", NS):
-        new_children.append(left_first)
-
-    new_children.append(make_del(first_run, del_text, next_id, author, date))
-    next_id += 1
-
-    if right_last.findall(".//w:t", NS):
-        new_children.append(right_last)
-
-    return next_id
-
-def apply_markers_after_filter(p: ET.Element, updated_marked: str, author: str, next_id: int):
-    full_text, run_map = build_paragraph_fulltext_and_runs(p)
-    if not full_text or not run_map:
-        return next_id
-
-    tokens = tokenize_updated_atomic(updated_marked)
     date = now_w3c()
 
-    cursor_char = 0
-    events = []
+    # ---------- 1) Read doc tokens ----------
+    doc_tokens = build_doc_tokens(p)
+    doc_token_strs = [dt.token for dt in doc_tokens]
 
-    # Build “future anchors” from TEXT chunks (raw)
-    # For insertion: next non-empty word token after INS
-    chunks = []
-    for k, v in tokens:
-        chunks.append((k, v))
+    # ---------- 2) Determine what stays visible ----------
+    keep_counter = Counter(updated.keep_tokens)
 
-    for idx, (kind, payload) in enumerate(chunks):
-        if kind == "DEL":
-            del_text = payload
-            if not del_text.strip():
-                continue
-
-            del_words = words_only(del_text)
-            span = find_word_sequence_span(full_text, del_words, start_char=cursor_char)
-            if span:
-                s, e = span
-                events.append((s, "DEL", (e, del_text)))
-                cursor_char = e
-            continue
-
-        if kind == "INS":
-            ins_text = payload
-            if not ins_text:
-                continue
-
-            # next anchor word
-            anchor_word = None
-            for j in range(idx + 1, len(chunks)):
-                if chunks[j][0] == "TEXT":
-                    for w in words_only(chunks[j][1]):
-                        anchor_word = w
-                        break
-                if anchor_word:
-                    break
-
-            if anchor_word:
-                pos = full_text.find(anchor_word, cursor_char)
-                insert_pos = pos if pos >= 0 else cursor_char
-            else:
-                insert_pos = len(full_text)
-
-            events.append((insert_pos, "INS", ins_text))
-            continue
-
-    if not events:
-        return next_id
-
-    # DEL before INS at same offset
-    events.sort(key=lambda x: (x[0], 0 if x[1] == "DEL" else 1))
-
-    old_children = list(p)
-    new_children = []
-    child_idx_ref = [0]
-
-    for off, kind, payload in events:
-        if kind == "DEL":
-            end_off, del_text = payload
-            next_id = apply_delete_span(
-                old_children, run_map, new_children, child_idx_ref,
-                off, end_off, del_text, author, next_id, date
-            )
+    # We'll build filtered normal tokens from doc, preserving order.
+    # Each normal token still carries its run template.
+    normal_tokens: List[DocToken] = []
+    for dt in doc_tokens:
+        if keep_counter[dt.token] > 0:
+            normal_tokens.append(dt)
+            keep_counter[dt.token] -= 1
         else:
-            ins_text = payload
-            rm = find_run_covering_offset(run_map, off)
-            base_run = rm["r"] if rm else run_map[0]["r"]
+            # token not in updated KEEP => removed
+            pass
 
-            while child_idx_ref[0] < len(old_children):
-                ch = old_children[child_idx_ref[0]]
-                if ch is base_run:
-                    break
-                new_children.append(ch)
-                child_idx_ref[0] += 1
+    # ---------- 3) Build a paragraph child list ----------
+    # Keep paragraph properties (<w:pPr>) as-is.
+    pPr = p.find("./w:pPr", NS)
 
-            if child_idx_ref[0] >= len(old_children) or old_children[child_idx_ref[0]] is not base_run:
-                new_children.append(make_ins(base_run, ins_text, next_id, author, date))
-                next_id += 1
-                continue
+    new_children: List[ET.Element] = []
+    if pPr is not None:
+        new_children.append(deepcopy(pPr))
 
-            local = off - rm["start"]
-            local = max(0, min(local, rm["end"] - rm["start"]))
+    # We'll create a working token list (normal stream),
+    # but deletions/insertions will be injected while building XML.
+    normal_strs = [t.token for t in normal_tokens]
 
-            left_run, right_run = split_run_at(base_run, local)
+    # ---------- 4) Apply deletions (wrap+remove from normal) ----------
+    # We will delete token sequences from the *normal stream* when present,
+    # and insert <w:del> nodes in their place.
+    #
+    # If a DEL block is not found in normal stream (because removed already),
+    # we search in original doc token stream to still show it as deletion.
+    #
+    # We'll process DEL blocks in order.
+    cursor = 0
+    del_nodes: List[Tuple[int, ET.Element, int]] = []  # (insert_index, node, token_count_removed)
 
-            child_idx_ref[0] += 1
+    for del_seq in updated.del_blocks:
+        if not del_seq:
+            continue
 
-            if left_run.findall(".//w:t", NS):
-                new_children.append(left_run)
+        found = find_sequence(normal_strs, del_seq, start=cursor)
 
-            new_children.append(make_ins(base_run, ins_text, next_id, author, date))
+        if found is not None:
+            # Build del text as it appears (join tokens without extra spaces).
+            # We keep it simple: join with single space between WORD tokens if needed is complicated.
+            # Instead, emit exactly " ".join(words) for readability.
+            del_text = " ".join(del_seq)
+
+            run_template = normal_tokens[found].run_template
+            node = make_del(run_template, del_text, next_id, author, date)
             next_id += 1
 
-            if right_run.findall(".//w:t", NS):
-                new_children.append(right_run)
+            del_nodes.append((found, node, len(del_seq)))
 
-    while child_idx_ref[0] < len(old_children):
-        new_children.append(old_children[child_idx_ref[0]])
-        child_idx_ref[0] += 1
+            # Remove that seq from normal tokens/strs
+            del normal_tokens[found : found + len(del_seq)]
+            del normal_strs[found : found + len(del_seq)]
 
+            cursor = found  # continue from deletion point
+        else:
+            # Not found in normal: try from original doc tokens to still show
+            found2 = find_sequence(doc_token_strs, del_seq, start=0)
+            if found2 is None:
+                continue
+
+            del_text = " ".join(del_seq)
+            run_template = doc_tokens[found2].run_template
+            node = make_del(run_template, del_text, next_id, author, date)
+            next_id += 1
+
+            # place near end if we cannot map
+            del_nodes.append((len(normal_tokens), node, 0))
+
+    # After processing, normal_tokens already updated.
+
+    # ---------- 5) Recompute normal_strs after deletions ----------
+    normal_strs = [t.token for t in normal_tokens]
+
+    # ---------- 6) Apply insertions based on anchor token ----------
+    # For each INS block:
+    #   - find the anchor token occurrence in normal_strs
+    #   - insert <w:ins> before anchor
+    #   - if no anchor => append at end
+    ins_nodes: List[Tuple[int, ET.Element]] = []
+    for ins_text, anchor in zip(updated.ins_blocks, updated.ins_anchors):
+        if ins_text is None:
+            continue
+        ins_text = ins_text.strip("\n")
+        if ins_text == "":
+            continue
+
+        if anchor is None:
+            idx = len(normal_tokens)
+            run_template = normal_tokens[-1].run_template if normal_tokens else (doc_tokens[0].run_template if doc_tokens else ET.Element(w_tag("r")))
+            ins_nodes.append((idx, make_ins(run_template, ins_text, next_id, author, date)))
+            next_id += 1
+            continue
+
+        # find anchor in remaining normal tokens
+        try:
+            idx = normal_strs.index(anchor)
+        except ValueError:
+            idx = len(normal_tokens)
+
+        run_template = normal_tokens[idx].run_template if idx < len(normal_tokens) else (normal_tokens[-1].run_template if normal_tokens else doc_tokens[0].run_template)
+        ins_nodes.append((idx, make_ins(run_template, ins_text, next_id, author, date)))
+        next_id += 1
+
+    # ---------- 7) Merge all events into one stream ----------
+    # We'll insert del_nodes and ins_nodes into the normal token stream positions.
+    #
+    # We'll build an "events map": position -> list of nodes
+    event_map: Dict[int, List[ET.Element]] = {}
+
+    for pos, node, _removed in del_nodes:
+        event_map.setdefault(pos, []).append(node)
+
+    for pos, node in ins_nodes:
+        event_map.setdefault(pos, []).append(node)
+
+    # ---------- 8) Emit runs while preserving formatting ----------
+    # We emit normal tokens grouped by run_template (formatting),
+    # and inject INS/DEL nodes at positions.
+    def flush_run_group(run_template: ET.Element, buf: List[str]):
+        if not buf:
+            return
+        # simple join with space between tokens is not correct in general.
+        # But our tokenizer removed spaces, so we need a "smart join".
+        #
+        # Smart join: if next token is punctuation, don't add space before it.
+        out = []
+        for t in buf:
+            if not out:
+                out.append(t)
+            else:
+                if re.match(r"[^\w\s]", t):  # punctuation token
+                    out.append(t)
+                else:
+                    out.append(" " + t)
+        text = "".join(out)
+
+        new_children.append(clone_run_with_text(run_template, text))
+        buf.clear()
+
+    buf: List[str] = []
+    current_template: Optional[ET.Element] = None
+
+    # Walk positions 0..len(normal_tokens) and inject events
+    for i in range(len(normal_tokens) + 1):
+        # inject events at i
+        if i in event_map:
+            flush_run_group(current_template, buf)
+            # stable ordering: DEL nodes first then INS nodes (Word typical)
+            for node in event_map[i]:
+                new_children.append(node)
+
+        if i == len(normal_tokens):
+            break
+
+        dt = normal_tokens[i]
+        if current_template is None:
+            current_template = dt.run_template
+
+        if dt.run_template is not current_template:
+            flush_run_group(current_template, buf)
+            current_template = dt.run_template
+
+        buf.append(dt.token)
+
+    flush_run_group(current_template, buf)
+
+    # ---------- 9) Replace paragraph content ----------
     for ch in list(p):
         p.remove(ch)
     for ch in new_children:
@@ -413,10 +466,22 @@ def apply_markers_after_filter(p: ET.Element, updated_marked: str, author: str, 
 
     return next_id
 
-# ----------------------------
-# Main apply
-# ----------------------------
-def apply_track_changes(document_xml_path: str, updated_txt_path: str, author: str = "Tanmay"):
+
+# ============================
+# Main: rebuild whole document.xml
+# ============================
+def rebuild_document_xml(
+    document_xml_path: str,
+    updated_txt_path: str,
+    out_xml_path: str,
+    author: str = "Tanmay",
+):
+    """
+    Create a NEW document xml with tracked changes based on updated.txt.
+
+    Paragraph mapping:
+      updated.txt uses [P1] .. [Pn] mapped to Word paragraphs (1-based).
+    """
     edits = parse_updated_txt(updated_txt_path)
 
     tree = ET.parse(document_xml_path)
@@ -429,30 +494,20 @@ def apply_track_changes(document_xml_path: str, updated_txt_path: str, author: s
     for i, p in enumerate(paragraphs, start=1):
         if i not in edits:
             continue
-
         updated_marked = edits[i]
-
-        # Keep words from outside text
-        updated_keep_text = strip_markers_keep_text(updated_marked)
-        keep_words = words_only(updated_keep_text)
-
-        # Also keep words inside DEL (so they remain to be wrapped)
-        del_words = []
-        for d in extract_all_del_text(updated_marked):
-            del_words.extend(words_only(d))
-
-        keep_counter = Counter(keep_words + del_words)
-
-        # Step 1: filter doc by keep words (spaces preserved)
-        filter_paragraph_preserve_spaces(p, keep_counter)
-
-        # Step 2: apply INS/DEL markers
-        next_id = apply_markers_after_filter(p, updated_marked, author, next_id)
-
+        plan = parse_updated_paragraph(updated_marked)
+        next_id = rebuild_paragraph(p, plan, author, next_id)
         changed += 1
 
-    tree.write(document_xml_path, encoding="utf-8", xml_declaration=True)
-    print(f"✅ Updated {changed} paragraphs (doc truth, spaces preserved, DEL works).")
+    tree.write(out_xml_path, encoding="utf-8", xml_declaration=True)
+    print(f"✅ Created new XML: {out_xml_path}")
+    print(f"✅ Updated {changed} paragraphs using track changes.")
+
 
 if __name__ == "__main__":
-    apply_track_changes("word/document.xml", "updated.txt", author="Tanmay")
+    rebuild_document_xml(
+        document_xml_path="word/document.xml",
+        updated_txt_path="updated.txt",
+        out_xml_path="word/document_updated.xml",
+        author="Tanmay",
+    )
