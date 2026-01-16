@@ -1,25 +1,46 @@
+"""
+build_documentxml_trackchanges_preserve_runs.py
+
+Goal
+----
+Create a NEW WordprocessingML document.xml (output) using:
+  - updated.txt as ground truth for words/content and explicit <INS:>/<DEL:> blocks
+  - document.xml as ground truth for formatting and run structure (w:r boundaries)
+
+Key policies
+------------
+1) Preserve formatting: keep the SAME run structure from document.xml as much as possible.
+2) updated.txt is truth: paragraph content comes from updated.txt.
+3) Track changes:
+   - <INS: ...> -> <w:ins> with ONE run containing the entire INS text
+   - <DEL: ...> -> <w:del> with ONE run containing the entire DEL text
+4) Matching strategy (two-phase):
+   - Phase 1: keep matching prefix tokens doc==updated outside markers
+   - Phase 2: after first mismatch, STOP matching; fill runs sequentially with updated content.
+     No forward searching for matches. No token lookahead.
+"""
+
 import re
 import xml.etree.ElementTree as ET
 from copy import deepcopy
-from collections import Counter
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
 
 # ============================
-# WordprocessingML namespace
+# Namespace
 # ============================
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 ET.register_namespace("w", NS["w"])
 
 
 def w_tag(tag: str) -> str:
-    """Return fully qualified WordprocessingML tag for ElementTree."""
+    """Return fully qualified WordprocessingML tag."""
     return f"{{{NS['w']}}}{tag}"
 
 
 def now_w3c() -> str:
-    """Return current UTC timestamp in Word track-changes format."""
+    """UTC timestamp in Word track-changes format."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -29,17 +50,18 @@ def now_w3c() -> str:
 LINE_RE = re.compile(r"^\[P(\d+)\]\s?(.*)$")
 MARK_RE = re.compile(r"<(INS|DEL):(.*?)>", re.DOTALL)
 
-# Tokenizer:
-# - words: letters/digits/underscore
-# - punctuation: every other non-space char
-# - spaces ignored as tokens
+# Token = word OR punctuation. Spaces are NOT tokens.
 TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
 def parse_updated_txt(path: str) -> Dict[int, str]:
     """
-    Parse updated.txt into:
-      { paragraph_index (1-based) : paragraph_string_with_markers }
+    Parse updated.txt lines of the form:
+
+      [P1] Some text <INS: new words> and <DEL: old words>
+
+    Returns:
+      dict { paragraph_index (1-based) -> updated paragraph string }
     """
     out: Dict[int, str] = {}
     with open(path, "r", encoding="utf-8") as f:
@@ -56,115 +78,92 @@ def parse_updated_txt(path: str) -> Dict[int, str]:
 
 def tokenize_words_punct(s: str) -> List[str]:
     """
-    Tokenize into word + punctuation tokens.
-    Spaces are not tokens.
-    Examples:
+    Tokenize text into word + punctuation tokens.
+    Spaces are removed at token level.
+
+    Example:
       "school," -> ["school", ","]
       "in-car"  -> ["in", "-", "car"]
     """
     return [m.group(0) for m in TOKEN_RE.finditer(s)]
 
 
+# ============================
+# Updated paragraph plan
+# ============================
+@dataclass
+class KeepToken:
+    """A normal (visible) token from updated.txt outside INS/DEL."""
+    token: str
+
+
+@dataclass
+class InsBlock:
+    """Atomic insertion block. Keep as one <w:ins>."""
+    text: str
+
+
+@dataclass
+class DelBlock:
+    """Atomic deletion block. Keep as one <w:del>."""
+    text: str
+
+
+UpdatedItem = Union[KeepToken, InsBlock, DelBlock]
+
+
 @dataclass
 class UpdatedPlan:
     """
-    Parsed representation of one updated paragraph.
+    Parsed plan for one updated paragraph.
 
-    keep_tokens:
-      tokens outside INS/DEL (what remains visible normal text)
-    del_blocks:
-      list of deletion blocks, each a token sequence
-    ins_blocks:
-      list of insertion blocks (raw string as-is)
-    ins_anchors:
-      for each ins block, the next KEEP token after it (or None if insertion at end)
-      used to place insertion in the rebuilt paragraph.
+    items: sequence of KeepToken / InsBlock / DelBlock in order.
+    keep_tokens_only: list of KeepToken tokens only (for matching prefix).
     """
-    keep_tokens: List[str]
-    del_blocks: List[List[str]]
-    ins_blocks: List[str]
-    ins_anchors: List[Optional[str]]
+    items: List[UpdatedItem]
+    keep_tokens_only: List[str]
 
 
 def parse_updated_paragraph(updated_marked: str) -> UpdatedPlan:
     """
-    Parse one updated paragraph into KEEP tokens + DEL token blocks + INS blocks.
-
-    INS blocks remain raw text (we will insert as ONE <w:ins>).
-    DEL blocks become token sequences for matching against document.xml tokens.
-
-    Also computes insertion anchors:
-      for each INS block, anchor = next KEEP token after that INS marker.
+    Parse a paragraph from updated.txt into a sequence:
+      KeepToken(token) for outside markers
+      InsBlock(text) for <INS:...>
+      DelBlock(text) for <DEL:...>
     """
-    keep_tokens: List[str] = []
-    del_blocks: List[List[str]] = []
-    ins_blocks: List[str] = []
-    ins_anchors: List[Optional[str]] = []
-
-    # We also build a stream of items in order:
-    # ("KEEP", token) or ("INS", raw) or ("DEL", token_list)
-    stream: List[Tuple[str, object]] = []
+    items: List[UpdatedItem] = []
+    keep_only: List[str] = []
 
     pos = 0
     for m in MARK_RE.finditer(updated_marked):
         outside = updated_marked[pos:m.start()]
         for t in tokenize_words_punct(outside):
-            keep_tokens.append(t)
-            stream.append(("KEEP", t))
+            items.append(KeepToken(t))
+            keep_only.append(t)
 
         kind = m.group(1)
         inner = m.group(2)
 
         if kind == "INS":
-            ins_blocks.append(inner)
-            stream.append(("INS", inner))
+            items.append(InsBlock(inner))
         else:
-            del_toks = tokenize_words_punct(inner)
-            del_blocks.append(del_toks)
-            stream.append(("DEL", del_toks))
+            items.append(DelBlock(inner))
 
         pos = m.end()
 
     tail = updated_marked[pos:]
     for t in tokenize_words_punct(tail):
-        keep_tokens.append(t)
-        stream.append(("KEEP", t))
+        items.append(KeepToken(t))
+        keep_only.append(t)
 
-    # Compute INS anchors: next KEEP token in the stream after INS
-    for idx, (k, v) in enumerate(stream):
-        if k != "INS":
-            continue
-        anchor = None
-        for j in range(idx + 1, len(stream)):
-            if stream[j][0] == "KEEP":
-                anchor = stream[j][1]  # token string
-                break
-        ins_anchors.append(anchor)
-
-    return UpdatedPlan(
-        keep_tokens=keep_tokens,
-        del_blocks=del_blocks,
-        ins_blocks=ins_blocks,
-        ins_anchors=ins_anchors,
-    )
+    return UpdatedPlan(items=items, keep_tokens_only=keep_only)
 
 
 # ============================
-# document.xml tokenization with run mapping
+# document.xml helpers
 # ============================
-@dataclass
-class DocToken:
-    """
-    One token from document.xml paragraph.
-    token: token string (word/punctuation)
-    run_template: the original <w:r> node this token came from (formatting source)
-    """
-    token: str
-    run_template: ET.Element
-
-
 def extract_run_text(run: ET.Element) -> str:
-    """Concatenate visible text from all <w:t> nodes inside this run."""
+    """Concatenate all w:t text inside a run."""
     parts = []
     for t in run.findall(".//w:t", NS):
         if t.text:
@@ -172,47 +171,42 @@ def extract_run_text(run: ET.Element) -> str:
     return "".join(parts)
 
 
-def build_doc_tokens(p: ET.Element) -> List[DocToken]:
+def set_run_text(run: ET.Element, text: str) -> None:
     """
-    Convert document.xml paragraph into token list with formatting mapping.
-
-    We walk runs in order:
-      each token inherits formatting from the run it came from.
+    Replace run's text with a single <w:t>.
+    Always sets xml:space="preserve" to avoid collapsing spaces.
     """
-    tokens: List[DocToken] = []
-    for r in p.findall(".//w:r", NS):
-        txt = extract_run_text(r)
-        if not txt:
-            continue
-        for tok in tokenize_words_punct(txt):
-            tokens.append(DocToken(tok, r))
-    return tokens
-
-
-# ============================
-# Track-change node constructors
-# ============================
-def clone_run_with_text(run_template: ET.Element, text: str) -> ET.Element:
-    """
-    Clone run template and set its visible text to `text`
-    with xml:space="preserve" to avoid space-loss collisions.
-    """
-    r = deepcopy(run_template)
-
-    # remove direct <w:t> children
-    for node in list(r):
+    # Remove direct w:t children of the run
+    for node in list(run):
         if node.tag == w_tag("t"):
-            r.remove(node)
+            run.remove(node)
+
+    if text == "":
+        return
 
     t = ET.Element(w_tag("t"))
     t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
     t.text = text
-    r.append(t)
+    run.append(t)
+
+
+def clone_run_with_text(run_template: ET.Element, text: str) -> ET.Element:
+    """Clone formatting from run_template and set its text."""
+    r = deepcopy(run_template)
+    # Remove direct w:t children
+    for node in list(r):
+        if node.tag == w_tag("t"):
+            r.remove(node)
+    if text != "":
+        t = ET.Element(w_tag("t"))
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t.text = text
+        r.append(t)
     return r
 
 
 def make_ins(run_template: ET.Element, text: str, ins_id: int, author: str, date: str) -> ET.Element:
-    """Create one <w:ins> containing the whole inserted text."""
+    """Create <w:ins> with ONE run containing entire inserted text."""
     ins = ET.Element(w_tag("ins"))
     ins.set(w_tag("id"), str(ins_id))
     ins.set(w_tag("author"), author)
@@ -222,13 +216,14 @@ def make_ins(run_template: ET.Element, text: str, ins_id: int, author: str, date
 
 
 def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date: str) -> ET.Element:
-    """Create one <w:del> containing the whole deleted text."""
+    """Create <w:del> with ONE run containing entire deleted text."""
     dele = ET.Element(w_tag("del"))
     dele.set(w_tag("id"), str(del_id))
     dele.set(w_tag("author"), author)
     dele.set(w_tag("date"), date)
 
     r = deepcopy(run_template)
+    # remove direct <w:t>
     for node in list(r):
         if node.tag == w_tag("t"):
             r.remove(node)
@@ -242,223 +237,227 @@ def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date
     return dele
 
 
-# ============================
-# Core matching helpers
-# ============================
-def find_sequence(tokens: List[str], seq: List[str], start: int = 0) -> Optional[int]:
+def smart_join_tokens(tokens: List[str]) -> str:
     """
-    Find seq inside tokens starting from index start.
-    Return starting index or None.
+    Join tokens into readable string without exploding spaces.
+
+    Rule:
+      - between two word tokens => add space
+      - before punctuation => no space
     """
-    if not seq:
-        return None
-    n = len(tokens)
-    m = len(seq)
-    for i in range(start, n - m + 1):
-        if tokens[i : i + m] == seq:
-            return i
-    return None
+    out = []
+    for tok in tokens:
+        if not out:
+            out.append(tok)
+        else:
+            if re.match(r"[^\w\s]", tok):  # punctuation
+                out.append(tok)
+            else:
+                out.append(" " + tok)
+    return "".join(out)
 
 
 # ============================
-# Paragraph rebuild
+# Core: preserve runs, fill content from updated.txt
 # ============================
-def rebuild_paragraph(
+@dataclass
+class RunBucket:
+    """
+    Run bucket represents one original run from document.xml.
+
+    We keep its formatting but rewrite its text.
+    """
+    run_template: ET.Element
+    # token budget: how many doc tokens originally lived in this run
+    token_budget: int
+
+
+def build_run_buckets(p: ET.Element) -> List[RunBucket]:
+    """
+    For a paragraph, build run buckets from its runs:
+      - keep original run template
+      - compute token budget from original run text tokenization
+    """
+    buckets: List[RunBucket] = []
+    for r in p.findall("./w:r", NS):
+        txt = extract_run_text(r)
+        toks = tokenize_words_punct(txt)
+        buckets.append(RunBucket(run_template=r, token_budget=len(toks)))
+    return buckets
+
+
+def extract_doc_prefix_tokens(p: ET.Element) -> List[str]:
+    """
+    Extract paragraph tokens from doc runs in order (word/punct only).
+    Used only for matching prefix.
+    """
+    toks: List[str] = []
+    for r in p.findall("./w:r", NS):
+        toks.extend(tokenize_words_punct(extract_run_text(r)))
+    return toks
+
+
+def rebuild_paragraph_preserve_runs(
     p: ET.Element,
-    updated: UpdatedPlan,
+    plan: UpdatedPlan,
     author: str,
     next_id: int,
 ) -> int:
     """
-    Build a NEW paragraph content using:
-      - document.xml as formatting ground truth
-      - updated.txt as token truth for which tokens remain
-      - apply <DEL> as <w:del>
-      - apply <INS> as <w:ins>
+    Rebuild one paragraph:
+      - preserve original run structure and formatting
+      - updated.txt provides all content
+      - Phase 1: keep matching prefix tokens doc==updated keep tokens
+      - Phase 2: on first mismatch, stop matching, and fill sequentially
 
-    Also removes doc tokens not present in updated KEEP tokens.
+    We write:
+      - updated KEEP tokens into normal runs (rewriting w:t)
+      - INS/DEL blocks as separate <w:ins>/<w:del> nodes
 
     Returns updated next_id.
     """
     date = now_w3c()
 
-    # ---------- 1) Read doc tokens ----------
-    doc_tokens = build_doc_tokens(p)
-    doc_token_strs = [dt.token for dt in doc_tokens]
-
-    # ---------- 2) Determine what stays visible ----------
-    keep_counter = Counter(updated.keep_tokens)
-
-    # We'll build filtered normal tokens from doc, preserving order.
-    # Each normal token still carries its run template.
-    normal_tokens: List[DocToken] = []
-    for dt in doc_tokens:
-        if keep_counter[dt.token] > 0:
-            normal_tokens.append(dt)
-            keep_counter[dt.token] -= 1
-        else:
-            # token not in updated KEEP => removed
-            pass
-
-    # ---------- 3) Build a paragraph child list ----------
-    # Keep paragraph properties (<w:pPr>) as-is.
+    # Keep paragraph properties (pPr) as-is
     pPr = p.find("./w:pPr", NS)
 
+    # Build run buckets (direct children runs only)
+    buckets = build_run_buckets(p)
+
+    # If there are no direct runs, create one synthetic run bucket
+    if not buckets:
+        synthetic_run = ET.Element(w_tag("r"))
+        buckets = [RunBucket(run_template=synthetic_run, token_budget=999999)]
+
+    # Build document tokens for prefix matching
+    doc_prefix_tokens = extract_doc_prefix_tokens(p)
+
+    # Build updated KEEP-only tokens for prefix matching
+    upd_keep = plan.keep_tokens_only
+
+    # -------- Phase 1: compute matching prefix length --------
+    prefix_len = 0
+    while prefix_len < len(doc_prefix_tokens) and prefix_len < len(upd_keep):
+        if doc_prefix_tokens[prefix_len] == upd_keep[prefix_len]:
+            prefix_len += 1
+        else:
+            break
+
+    # We will now emit ALL updated items, but:
+    # - first prefix_len KeepTokens are considered "match phase"
+    # - after that, we're in phase2 (fill sequentially, no matching)
+    #
+    # Practically: we always just write updated tokens; prefix_len is only used
+    # to decide initial run consumption alignment.
+
+    # Build output paragraph children list
     new_children: List[ET.Element] = []
     if pPr is not None:
         new_children.append(deepcopy(pPr))
 
-    # We'll create a working token list (normal stream),
-    # but deletions/insertions will be injected while building XML.
-    normal_strs = [t.token for t in normal_tokens]
+    # Run pointer for buckets
+    b_idx = 0
+    b_used = 0  # how many tokens placed into current bucket
+    current_tokens: List[str] = []  # tokens accumulated for current run output
 
-    # ---------- 4) Apply deletions (wrap+remove from normal) ----------
-    # We will delete token sequences from the *normal stream* when present,
-    # and insert <w:del> nodes in their place.
+    # Helper: flush current bucket into a <w:r> node
+    def flush_run_bucket():
+        nonlocal b_idx, b_used, current_tokens
+        if b_idx >= len(buckets):
+            return
+        # Clone formatting and write tokens
+        tmpl = buckets[b_idx].run_template
+        text = smart_join_tokens(current_tokens)
+        new_children.append(clone_run_with_text(tmpl, text))
+        current_tokens = []
+        b_used = 0
+        b_idx += 1
+
+    # Helper: ensure we have a current bucket available
+    def ensure_bucket():
+        nonlocal b_idx
+        if b_idx >= len(buckets):
+            # extend last bucket by reusing last run formatting
+            last_tmpl = buckets[-1].run_template
+            buckets.append(RunBucket(run_template=last_tmpl, token_budget=999999))
+
+    # Helper: consume one token into current run bucket
+    def add_token_to_current_run(tok: str):
+        nonlocal b_used
+        ensure_bucket()
+        current_tokens.append(tok)
+        b_used += 1
+        # if exceeded budget, flush and continue
+        if b_used >= buckets[b_idx].token_budget and buckets[b_idx].token_budget > 0:
+            flush_run_bucket()
+
+    # Helper: flush current run tokens before inserting ins/del node
+    def flush_before_change_node():
+        nonlocal current_tokens
+        # If we already accumulated some tokens for current bucket, flush them into a run
+        if current_tokens:
+            # Do NOT advance bucket if we didn't fill budget - keep same template for later tokens?
+            # But we want to keep run boundaries the same. If we flush early, we'd create extra run.
+            #
+            # Requirement says: keep runs same. So we will flush into the SAME bucket template
+            # and then move to next bucket (effectively "closing the run").
+            flush_run_bucket()
+
+    # Determine initial bucket alignment from prefix_len:
+    # We try to spend prefix_len tokens into buckets first to preserve early-run mapping.
+    # This is done naturally by just writing updated tokens into buckets sequentially,
+    # but we can pre-consume budgets if doc prefix tokens match across run boundaries.
     #
-    # If a DEL block is not found in normal stream (because removed already),
-    # we search in original doc token stream to still show it as deletion.
-    #
-    # We'll process DEL blocks in order.
-    cursor = 0
-    del_nodes: List[Tuple[int, ET.Element, int]] = []  # (insert_index, node, token_count_removed)
+    # Simpler: do nothing special; writing sequentially already respects budgets.
 
-    for del_seq in updated.del_blocks:
-        if not del_seq:
-            continue
+    # Now emit updated items sequentially
+    for item in plan.items:
+        if isinstance(item, KeepToken):
+            add_token_to_current_run(item.token)
 
-        found = find_sequence(normal_strs, del_seq, start=cursor)
-
-        if found is not None:
-            # Build del text as it appears (join tokens without extra spaces).
-            # We keep it simple: join with single space between WORD tokens if needed is complicated.
-            # Instead, emit exactly " ".join(words) for readability.
-            del_text = " ".join(del_seq)
-
-            run_template = normal_tokens[found].run_template
-            node = make_del(run_template, del_text, next_id, author, date)
-            next_id += 1
-
-            del_nodes.append((found, node, len(del_seq)))
-
-            # Remove that seq from normal tokens/strs
-            del normal_tokens[found : found + len(del_seq)]
-            del normal_strs[found : found + len(del_seq)]
-
-            cursor = found  # continue from deletion point
-        else:
-            # Not found in normal: try from original doc tokens to still show
-            found2 = find_sequence(doc_token_strs, del_seq, start=0)
-            if found2 is None:
+        elif isinstance(item, InsBlock):
+            ins_text = item.text
+            if ins_text is None:
+                continue
+            ins_text = ins_text.strip("\n")
+            if ins_text == "":
                 continue
 
-            del_text = " ".join(del_seq)
-            run_template = doc_tokens[found2].run_template
-            node = make_del(run_template, del_text, next_id, author, date)
+            flush_before_change_node()
+            ensure_bucket()
+
+            # Use current bucket's template if available; otherwise last template.
+            tmpl = buckets[b_idx].run_template if b_idx < len(buckets) else buckets[-1].run_template
+            new_children.append(make_ins(tmpl, ins_text, next_id, author, date))
             next_id += 1
 
-            # place near end if we cannot map
-            del_nodes.append((len(normal_tokens), node, 0))
+        elif isinstance(item, DelBlock):
+            del_text = item.text
+            if del_text is None:
+                continue
+            del_text = del_text.strip("\n")
+            if del_text == "":
+                continue
 
-    # After processing, normal_tokens already updated.
+            flush_before_change_node()
+            ensure_bucket()
 
-    # ---------- 5) Recompute normal_strs after deletions ----------
-    normal_strs = [t.token for t in normal_tokens]
-
-    # ---------- 6) Apply insertions based on anchor token ----------
-    # For each INS block:
-    #   - find the anchor token occurrence in normal_strs
-    #   - insert <w:ins> before anchor
-    #   - if no anchor => append at end
-    ins_nodes: List[Tuple[int, ET.Element]] = []
-    for ins_text, anchor in zip(updated.ins_blocks, updated.ins_anchors):
-        if ins_text is None:
-            continue
-        ins_text = ins_text.strip("\n")
-        if ins_text == "":
-            continue
-
-        if anchor is None:
-            idx = len(normal_tokens)
-            run_template = normal_tokens[-1].run_template if normal_tokens else (doc_tokens[0].run_template if doc_tokens else ET.Element(w_tag("r")))
-            ins_nodes.append((idx, make_ins(run_template, ins_text, next_id, author, date)))
+            tmpl = buckets[b_idx].run_template if b_idx < len(buckets) else buckets[-1].run_template
+            new_children.append(make_del(tmpl, del_text, next_id, author, date))
             next_id += 1
-            continue
 
-        # find anchor in remaining normal tokens
-        try:
-            idx = normal_strs.index(anchor)
-        except ValueError:
-            idx = len(normal_tokens)
+    # Flush remaining tokens into remaining buckets
+    if current_tokens:
+        flush_run_bucket()
 
-        run_template = normal_tokens[idx].run_template if idx < len(normal_tokens) else (normal_tokens[-1].run_template if normal_tokens else doc_tokens[0].run_template)
-        ins_nodes.append((idx, make_ins(run_template, ins_text, next_id, author, date)))
-        next_id += 1
+    # If we still have unused buckets (original runs) beyond what updated text needed:
+    # emit them as empty runs (preserves run structure).
+    while b_idx < len(buckets):
+        tmpl = buckets[b_idx].run_template
+        new_children.append(clone_run_with_text(tmpl, ""))  # empty text
+        b_idx += 1
 
-    # ---------- 7) Merge all events into one stream ----------
-    # We'll insert del_nodes and ins_nodes into the normal token stream positions.
-    #
-    # We'll build an "events map": position -> list of nodes
-    event_map: Dict[int, List[ET.Element]] = {}
-
-    for pos, node, _removed in del_nodes:
-        event_map.setdefault(pos, []).append(node)
-
-    for pos, node in ins_nodes:
-        event_map.setdefault(pos, []).append(node)
-
-    # ---------- 8) Emit runs while preserving formatting ----------
-    # We emit normal tokens grouped by run_template (formatting),
-    # and inject INS/DEL nodes at positions.
-    def flush_run_group(run_template: ET.Element, buf: List[str]):
-        if not buf:
-            return
-        # simple join with space between tokens is not correct in general.
-        # But our tokenizer removed spaces, so we need a "smart join".
-        #
-        # Smart join: if next token is punctuation, don't add space before it.
-        out = []
-        for t in buf:
-            if not out:
-                out.append(t)
-            else:
-                if re.match(r"[^\w\s]", t):  # punctuation token
-                    out.append(t)
-                else:
-                    out.append(" " + t)
-        text = "".join(out)
-
-        new_children.append(clone_run_with_text(run_template, text))
-        buf.clear()
-
-    buf: List[str] = []
-    current_template: Optional[ET.Element] = None
-
-    # Walk positions 0..len(normal_tokens) and inject events
-    for i in range(len(normal_tokens) + 1):
-        # inject events at i
-        if i in event_map:
-            flush_run_group(current_template, buf)
-            # stable ordering: DEL nodes first then INS nodes (Word typical)
-            for node in event_map[i]:
-                new_children.append(node)
-
-        if i == len(normal_tokens):
-            break
-
-        dt = normal_tokens[i]
-        if current_template is None:
-            current_template = dt.run_template
-
-        if dt.run_template is not current_template:
-            flush_run_group(current_template, buf)
-            current_template = dt.run_template
-
-        buf.append(dt.token)
-
-    flush_run_group(current_template, buf)
-
-    # ---------- 9) Replace paragraph content ----------
+    # Replace paragraph children with new_children (pPr + runs + ins/del)
     for ch in list(p):
         p.remove(ch)
     for ch in new_children:
@@ -468,19 +467,19 @@ def rebuild_paragraph(
 
 
 # ============================
-# Main: rebuild whole document.xml
+# Apply to whole document.xml
 # ============================
-def rebuild_document_xml(
+def rebuild_document_xml_preserve_runs(
     document_xml_path: str,
     updated_txt_path: str,
     out_xml_path: str,
     author: str = "Tanmay",
 ):
     """
-    Create a NEW document xml with tracked changes based on updated.txt.
-
-    Paragraph mapping:
-      updated.txt uses [P1] .. [Pn] mapped to Word paragraphs (1-based).
+    Build a new document xml that:
+      - uses updated.txt as ground truth content
+      - preserves formatting/run structure from document.xml
+      - adds track changes for INS/DEL blocks
     """
     edits = parse_updated_txt(updated_txt_path)
 
@@ -494,18 +493,17 @@ def rebuild_document_xml(
     for i, p in enumerate(paragraphs, start=1):
         if i not in edits:
             continue
-        updated_marked = edits[i]
-        plan = parse_updated_paragraph(updated_marked)
-        next_id = rebuild_paragraph(p, plan, author, next_id)
+        plan = parse_updated_paragraph(edits[i])
+        next_id = rebuild_paragraph_preserve_runs(p, plan, author, next_id)
         changed += 1
 
     tree.write(out_xml_path, encoding="utf-8", xml_declaration=True)
     print(f"✅ Created new XML: {out_xml_path}")
-    print(f"✅ Updated {changed} paragraphs using track changes.")
+    print(f"✅ Updated {changed} paragraphs.")
 
 
 if __name__ == "__main__":
-    rebuild_document_xml(
+    rebuild_document_xml_preserve_runs(
         document_xml_path="word/document.xml",
         updated_txt_path="updated.txt",
         out_xml_path="word/document_updated.xml",
