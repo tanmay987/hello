@@ -18,6 +18,7 @@ Key policies
    - Phase 1: keep matching prefix tokens doc==updated outside markers
    - Phase 2: after first mismatch, STOP matching; fill runs sequentially with updated content.
      No forward searching for matches. No token lookahead.
+5) FIXED: token joining now preserves spaces between words (prevents "allnon" collisions).
 """
 
 import re
@@ -56,8 +57,7 @@ TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 def parse_updated_txt(path: str) -> Dict[int, str]:
     """
-    Parse updated.txt lines of the form:
-
+    Parse updated.txt lines:
       [P1] Some text <INS: new words> and <DEL: old words>
 
     Returns:
@@ -126,7 +126,7 @@ class UpdatedPlan:
 
 def parse_updated_paragraph(updated_marked: str) -> UpdatedPlan:
     """
-    Parse a paragraph from updated.txt into a sequence:
+    Parse one updated paragraph into a sequence:
       KeepToken(token) for outside markers
       InsBlock(text) for <INS:...>
       DelBlock(text) for <DEL:...>
@@ -171,37 +171,24 @@ def extract_run_text(run: ET.Element) -> str:
     return "".join(parts)
 
 
-def set_run_text(run: ET.Element, text: str) -> None:
-    """
-    Replace run's text with a single <w:t>.
-    Always sets xml:space="preserve" to avoid collapsing spaces.
-    """
-    # Remove direct w:t children of the run
-    for node in list(run):
-        if node.tag == w_tag("t"):
-            run.remove(node)
-
-    if text == "":
-        return
-
-    t = ET.Element(w_tag("t"))
-    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-    t.text = text
-    run.append(t)
-
-
 def clone_run_with_text(run_template: ET.Element, text: str) -> ET.Element:
-    """Clone formatting from run_template and set its text."""
+    """
+    Clone formatting from run_template and set its text.
+    Uses xml:space="preserve" to avoid collapsing spaces.
+    """
     r = deepcopy(run_template)
+
     # Remove direct w:t children
     for node in list(r):
         if node.tag == w_tag("t"):
             r.remove(node)
+
     if text != "":
         t = ET.Element(w_tag("t"))
         t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         t.text = text
         r.append(t)
+
     return r
 
 
@@ -223,7 +210,8 @@ def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date
     dele.set(w_tag("date"), date)
 
     r = deepcopy(run_template)
-    # remove direct <w:t>
+
+    # Remove direct <w:t>
     for node in list(r):
         if node.tag == w_tag("t"):
             r.remove(node)
@@ -239,21 +227,41 @@ def make_del(run_template: ET.Element, text: str, del_id: int, author: str, date
 
 def smart_join_tokens(tokens: List[str]) -> str:
     """
-    Join tokens into readable string without exploding spaces.
+    Join tokens into readable text WITHOUT removing spaces between words.
 
-    Rule:
-      - between two word tokens => add space
-      - before punctuation => no space
+    Conservative spacing rules:
+      - default: insert ONE space between tokens
+      - NO space BEFORE: , . ; : ? ! ) ] }
+      - NO space AFTER:  ( [ {
+      - also no space around hyphen '-' for "in-car" style joins
     """
-    out = []
-    for tok in tokens:
-        if not out:
-            out.append(tok)
-        else:
-            if re.match(r"[^\w\s]", tok):  # punctuation
-                out.append(tok)
-            else:
-                out.append(" " + tok)
+    if not tokens:
+        return ""
+
+    NO_SPACE_BEFORE = {",", ".", ";", ":", "?", "!", ")", "]", "}", "%"}
+    NO_SPACE_AFTER = {"(", "[", "{"}
+
+    out = [tokens[0]]
+
+    for prev, cur in zip(tokens, tokens[1:]):
+        # Hyphen joins: in-car, 10-12
+        if prev == "-" or cur == "-":
+            out.append(cur)
+            continue
+
+        # no space after opening brackets
+        if prev in NO_SPACE_AFTER:
+            out.append(cur)
+            continue
+
+        # no space before closing punctuation
+        if cur in NO_SPACE_BEFORE:
+            out.append(cur)
+            continue
+
+        # default: add a space
+        out.append(" " + cur)
+
     return "".join(out)
 
 
@@ -263,20 +271,20 @@ def smart_join_tokens(tokens: List[str]) -> str:
 @dataclass
 class RunBucket:
     """
-    Run bucket represents one original run from document.xml.
+    One original run bucket from document.xml.
 
-    We keep its formatting but rewrite its text.
+    token_budget is how many doc tokens were originally in that run.
+    We fill updated tokens into the same run pattern.
     """
     run_template: ET.Element
-    # token budget: how many doc tokens originally lived in this run
     token_budget: int
 
 
 def build_run_buckets(p: ET.Element) -> List[RunBucket]:
     """
-    For a paragraph, build run buckets from its runs:
-      - keep original run template
-      - compute token budget from original run text tokenization
+    Build run buckets from paragraph direct runs:
+      - each bucket retains formatting template
+      - token_budget is the original token count in that run
     """
     buckets: List[RunBucket] = []
     for r in p.findall("./w:r", NS):
@@ -288,7 +296,7 @@ def build_run_buckets(p: ET.Element) -> List[RunBucket]:
 
 def extract_doc_prefix_tokens(p: ET.Element) -> List[str]:
     """
-    Extract paragraph tokens from doc runs in order (word/punct only).
+    Extract paragraph tokens from doc direct runs in order.
     Used only for matching prefix.
     """
     toks: List[str] = []
@@ -304,17 +312,11 @@ def rebuild_paragraph_preserve_runs(
     next_id: int,
 ) -> int:
     """
-    Rebuild one paragraph:
-      - preserve original run structure and formatting
-      - updated.txt provides all content
-      - Phase 1: keep matching prefix tokens doc==updated keep tokens
-      - Phase 2: on first mismatch, stop matching, and fill sequentially
+    Rebuild ONE paragraph with updated.txt as truth but preserve run formatting:
 
-    We write:
-      - updated KEEP tokens into normal runs (rewriting w:t)
-      - INS/DEL blocks as separate <w:ins>/<w:del> nodes
-
-    Returns updated next_id.
+    - Uses existing runs as buckets, filling tokens based on each run's original token budget.
+    - Inserts <w:ins>/<w:del> as separate nodes, closing current run first.
+    - Does not create run-per-word.
     """
     date = now_w3c()
 
@@ -324,18 +326,15 @@ def rebuild_paragraph_preserve_runs(
     # Build run buckets (direct children runs only)
     buckets = build_run_buckets(p)
 
-    # If there are no direct runs, create one synthetic run bucket
+    # If no direct runs exist, create a synthetic bucket
     if not buckets:
         synthetic_run = ET.Element(w_tag("r"))
         buckets = [RunBucket(run_template=synthetic_run, token_budget=999999)]
 
-    # Build document tokens for prefix matching
+    # Prefix match length (not heavily used; kept for semantics)
     doc_prefix_tokens = extract_doc_prefix_tokens(p)
-
-    # Build updated KEEP-only tokens for prefix matching
     upd_keep = plan.keep_tokens_only
 
-    # -------- Phase 1: compute matching prefix length --------
     prefix_len = 0
     while prefix_len < len(doc_prefix_tokens) and prefix_len < len(upd_keep):
         if doc_prefix_tokens[prefix_len] == upd_keep[prefix_len]:
@@ -343,121 +342,98 @@ def rebuild_paragraph_preserve_runs(
         else:
             break
 
-    # We will now emit ALL updated items, but:
-    # - first prefix_len KeepTokens are considered "match phase"
-    # - after that, we're in phase2 (fill sequentially, no matching)
-    #
-    # Practically: we always just write updated tokens; prefix_len is only used
-    # to decide initial run consumption alignment.
-
-    # Build output paragraph children list
+    # Output paragraph children
     new_children: List[ET.Element] = []
     if pPr is not None:
         new_children.append(deepcopy(pPr))
 
-    # Run pointer for buckets
+    # Bucket pointer
     b_idx = 0
-    b_used = 0  # how many tokens placed into current bucket
-    current_tokens: List[str] = []  # tokens accumulated for current run output
+    b_used = 0
+    current_tokens: List[str] = []
 
-    # Helper: flush current bucket into a <w:r> node
-    def flush_run_bucket():
+    def ensure_bucket():
+        nonlocal buckets, b_idx
+        if b_idx >= len(buckets):
+            # reuse last run formatting if updated is longer
+            last_tmpl = buckets[-1].run_template
+            buckets.append(RunBucket(run_template=last_tmpl, token_budget=999999))
+
+    def flush_run_bucket(force_advance: bool = True):
+        """
+        Flush current_tokens into a run using the current bucket template.
+
+        force_advance=True means "close this run" and move to next run.
+        We use force_advance when we must insert INS/DEL (close previous run).
+        """
         nonlocal b_idx, b_used, current_tokens
         if b_idx >= len(buckets):
             return
-        # Clone formatting and write tokens
         tmpl = buckets[b_idx].run_template
         text = smart_join_tokens(current_tokens)
         new_children.append(clone_run_with_text(tmpl, text))
         current_tokens = []
         b_used = 0
-        b_idx += 1
+        if force_advance:
+            b_idx += 1
 
-    # Helper: ensure we have a current bucket available
-    def ensure_bucket():
-        nonlocal b_idx
-        if b_idx >= len(buckets):
-            # extend last bucket by reusing last run formatting
-            last_tmpl = buckets[-1].run_template
-            buckets.append(RunBucket(run_template=last_tmpl, token_budget=999999))
-
-    # Helper: consume one token into current run bucket
     def add_token_to_current_run(tok: str):
         nonlocal b_used
         ensure_bucket()
         current_tokens.append(tok)
         b_used += 1
-        # if exceeded budget, flush and continue
-        if b_used >= buckets[b_idx].token_budget and buckets[b_idx].token_budget > 0:
-            flush_run_bucket()
+        # If we filled the bucket budget, flush and advance
+        if buckets[b_idx].token_budget > 0 and b_used >= buckets[b_idx].token_budget:
+            flush_run_bucket(force_advance=True)
 
-    # Helper: flush current run tokens before inserting ins/del node
     def flush_before_change_node():
+        """Close current run before inserting a <w:ins>/<w:del> node."""
         nonlocal current_tokens
-        # If we already accumulated some tokens for current bucket, flush them into a run
         if current_tokens:
-            # Do NOT advance bucket if we didn't fill budget - keep same template for later tokens?
-            # But we want to keep run boundaries the same. If we flush early, we'd create extra run.
-            #
-            # Requirement says: keep runs same. So we will flush into the SAME bucket template
-            # and then move to next bucket (effectively "closing the run").
-            flush_run_bucket()
+            flush_run_bucket(force_advance=True)
+        else:
+            # Even if empty, we "close" current run and move forward
+            if b_idx < len(buckets):
+                flush_run_bucket(force_advance=True)
 
-    # Determine initial bucket alignment from prefix_len:
-    # We try to spend prefix_len tokens into buckets first to preserve early-run mapping.
-    # This is done naturally by just writing updated tokens into buckets sequentially,
-    # but we can pre-consume budgets if doc prefix tokens match across run boundaries.
-    #
-    # Simpler: do nothing special; writing sequentially already respects budgets.
-
-    # Now emit updated items sequentially
+    # Emit updated items sequentially
     for item in plan.items:
         if isinstance(item, KeepToken):
             add_token_to_current_run(item.token)
 
         elif isinstance(item, InsBlock):
-            ins_text = item.text
-            if ins_text is None:
-                continue
-            ins_text = ins_text.strip("\n")
+            ins_text = (item.text or "").strip("\n")
             if ins_text == "":
                 continue
 
             flush_before_change_node()
             ensure_bucket()
-
-            # Use current bucket's template if available; otherwise last template.
-            tmpl = buckets[b_idx].run_template if b_idx < len(buckets) else buckets[-1].run_template
+            tmpl = buckets[b_idx].run_template
             new_children.append(make_ins(tmpl, ins_text, next_id, author, date))
             next_id += 1
 
         elif isinstance(item, DelBlock):
-            del_text = item.text
-            if del_text is None:
-                continue
-            del_text = del_text.strip("\n")
+            del_text = (item.text or "").strip("\n")
             if del_text == "":
                 continue
 
             flush_before_change_node()
             ensure_bucket()
-
-            tmpl = buckets[b_idx].run_template if b_idx < len(buckets) else buckets[-1].run_template
+            tmpl = buckets[b_idx].run_template
             new_children.append(make_del(tmpl, del_text, next_id, author, date))
             next_id += 1
 
-    # Flush remaining tokens into remaining buckets
+    # Flush remaining tokens to current bucket (close it)
     if current_tokens:
-        flush_run_bucket()
+        flush_run_bucket(force_advance=True)
 
-    # If we still have unused buckets (original runs) beyond what updated text needed:
-    # emit them as empty runs (preserves run structure).
+    # Preserve remaining original runs as empty
     while b_idx < len(buckets):
         tmpl = buckets[b_idx].run_template
-        new_children.append(clone_run_with_text(tmpl, ""))  # empty text
+        new_children.append(clone_run_with_text(tmpl, ""))
         b_idx += 1
 
-    # Replace paragraph children with new_children (pPr + runs + ins/del)
+    # Replace paragraph children
     for ch in list(p):
         p.remove(ch)
     for ch in new_children:
@@ -476,10 +452,9 @@ def rebuild_document_xml_preserve_runs(
     author: str = "Tanmay",
 ):
     """
-    Build a new document xml that:
-      - uses updated.txt as ground truth content
-      - preserves formatting/run structure from document.xml
-      - adds track changes for INS/DEL blocks
+    Build a NEW document xml:
+      - updated.txt provides content + INS/DEL
+      - document.xml provides formatting + run boundaries
     """
     edits = parse_updated_txt(updated_txt_path)
 
