@@ -1,33 +1,43 @@
-from docx import Document
+import zipfile
 import io
+import xml.etree.ElementTree as ET
+from flask import Flask, request, jsonify
 
-# ========== 1) Extract text ==========
+app = Flask(__name__)
 
-def extract_docx(file):
-    """
-    file: uploaded file (docx)
-    returns: {"text": "..."}
-    """
-    content = file.read()
-    doc = Document(io.BytesIO(content))
+# ------------------------------------------------
+# Extract text from word/document.xml inside DOCX
+# ------------------------------------------------
 
-    text = "\n".join(p.text for p in doc.paragraphs)
-    return {"text": text}
+def extract_text_from_docx_bytes(docx_bytes):
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+        xml_content = z.read("word/document.xml")
+
+    root = ET.fromstring(xml_content)
+
+    # Word namespace
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    texts = []
+    for node in root.findall(".//w:t", ns):
+        if node.text:
+            texts.append(node.text)
+
+    return "\n".join(texts)
 
 
-# ========== 2) Build docx ==========
+# ------------------------------------------------
+# Upload endpoint
+# ------------------------------------------------
 
-def build_docx(text):
-    """
-    text: string
-    returns: docx file
-    """
-    doc = Document()
-    for line in text.split("\n"):
-        doc.add_paragraph(line)
+@app.route("/upload", methods=["POST"])
+def upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
 
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
+    f = request.files["file"]
+    data = f.read()
 
-    return buffer
+    text = extract_text_from_docx_bytes(data)
+
+    return jsonify({"text": text})
