@@ -1,36 +1,29 @@
 from docx import Document
 import io
-from pydantic import BaseModel
 
-# -------------------------
-# 1) Extract text from docx
-# -------------------------
+# ========== 1) Extract text ==========
 
 def extract_docx(file):
     """
-    Input: file (uploaded docx)
-    Output: {"text": "..."}
+    file: uploaded file (docx)
+    returns: {"text": "..."}
     """
     content = file.read()
     doc = Document(io.BytesIO(content))
+
     text = "\n".join(p.text for p in doc.paragraphs)
     return {"text": text}
 
 
-# -------------------------
-# 2) Build docx from text
-# -------------------------
+# ========== 2) Build docx ==========
 
-class BuildRequest(BaseModel):
-    text: str
-
-def build_docx(body: BuildRequest):
+def build_docx(text):
     """
-    Input: {"text": "..."}
-    Output: docx file
+    text: string
+    returns: docx file
     """
     doc = Document()
-    for line in body.text.split("\n"):
+    for line in text.split("\n"):
         doc.add_paragraph(line)
 
     buffer = io.BytesIO()
